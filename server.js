@@ -6,6 +6,10 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' })); // Increase limit for large payloads
 
 // Proxy endpoint for Claude API
+app.get("/", (req, res) => {
+  res.send("Hello, World!");
+});
+  
 app.post('/api/claude', async (req, res) => {
   console.log('\n========================================');
   console.log('📥 Received Claude API request');
@@ -94,4 +98,5 @@ app.post('/api/tavily', async (req, res) => {
 const PORT = 3001;
 app.listen(PORT, () => {
   console.log(`✅ Proxy server running on http://localhost:${PORT}`);
+
 });
