@@ -1,236 +1,265 @@
 const express = require('express');
 const cors = require('cors');
+require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' })); // Increase limit for large payloads
+app.use(express.json({ limit: '50mb' }));
 
-// Proxy endpoint for Claude API
+// ensure fetch available in older Node versions
+if (typeof global.fetch !== 'function') {
+  // dynamic import avoids break on environments with native fetch
+  (async () => {
+    try {
+      const nodeFetch = await import('node-fetch');
+      global.fetch = nodeFetch.default || nodeFetch;
+    } catch (e) {
+      console.warn('node-fetch not available; fetch calls may fail on old Node versions.');
+    }
+  })();
+}
+
+// --- Claude proxy (keeps original behavior) ---
 app.post('/api/claude', async (req, res) => {
-  console.log('\n========================================');
-  console.log('📥 Received Claude API request');
-  console.log('Messages count:', req.body.data.messages?.length);
-  
-  // Log each message in the conversation
-  if (req.body.data.messages) {
-    req.body.data.messages.forEach((msg, idx) => {
-      console.log(`\nMessage ${idx}:`);
-      console.log('  Role:', msg.role);
-      console.log('  Content type:', typeof msg.content);
-      if (typeof msg.content === 'string') {
-        console.log('  Content preview:', msg.content.substring(0, 100) + '...');
-      } else if (Array.isArray(msg.content)) {
-        console.log('  Content array length:', msg.content.length);
-        msg.content.forEach((item, i) => {
-          console.log(`    Item ${i} type:`, item.type);
-        });
-      }
-    });
-  }
-  
   try {
-    console.log('\n📤 Sending to Claude API...');
-    
+    console.log('📥 /api/claude called');
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': req.body.apiKey,
+        'x-api-key': req.body.apiKey || process.env.CLAUDE_API_KEY,
         'anthropic-version': '2023-06-01'
       },
-      body: JSON.stringify(req.body.data)
+      body: JSON.stringify(req.body.data || {})
     });
-
     const data = await response.json();
-    
-    console.log('✅ Response from Claude:');
-    console.log('  Status:', response.status);
-    console.log('  Content blocks:', data.content?.length || 0);
-    console.log('  Stop reason:', data.stop_reason);
-    console.log('  Output tokens:', data.usage?.output_tokens);
-    
-    if (data.content && data.content.length > 0) {
-      data.content.forEach((block, idx) => {
-        console.log(`  Block ${idx} type:`, block.type);
-        if (block.type === 'text' && block.text) {
-          console.log(`  Text length:`, block.text.length);
-          console.log(`  Text preview:`, block.text.substring(0, 200));
-        }
-      });
-    }
-    
-    console.log('========================================\n');
-    
-    res.json(data);
-  } catch (error) {
-    console.error('❌ Error:', error.message);
-    console.log('========================================\n');
-    res.status(500).json({ error: error.message });
+    res.status(response.status).json(data);
+  } catch (err) {
+    console.error('Claude proxy error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// Proxy endpoint for Tavily API
+// --- Tavily proxy ---
 app.post('/api/tavily', async (req, res) => {
-  console.log('📥 Tavily search request for:', req.body.query);
-  
   try {
+    console.log('📥 /api/tavily called');
     const response = await fetch('https://api.tavily.com/search', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(req.body)
     });
-
     const data = await response.json();
-    console.log('✅ Tavily returned', data.results?.length || 0, 'results');
-    res.json(data);
-  } catch (error) {
-    console.error('❌ Tavily error:', error.message);
-    res.status(500).json({ error: error.message });
+    res.status(response.status || 200).json(data);
+  } catch (err) {
+    console.error('Tavily proxy error:', err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
+// --- Generative model support (optional) ---
+let genAI = null;
+let hasGenAI = false;
+try {
+  // don't crash if package missing
+  const { GoogleGenerativeAI } = require('@google/generative-ai');
+  genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+  hasGenAI = !!process.env.GEMINI_API_KEY;
+} catch (e) {
+  console.warn('@google/generative-ai not available or not configured. Falling back to local parser.');
+  hasGenAI = false;
+}
 
+// Helper: fallback parser (regex + simple rules)
+const CITY_SYNONYMS = {
+  bengaluru: 'Bangalore',
+  bengalore: 'Bangalore',
+  bangalore: 'Bangalore',
+  mumbai: 'Mumbai',
+  bombay: 'Mumbai',
+  delhi: 'Delhi',
+  ncr: 'Delhi',
+  hyderabad: 'Hyderabad',
+  chennai: 'Chennai',
+  pune: 'Pune',
+  gurgaon: 'Gurgaon',
+  gurugram: 'Gurgaon'
+};
 
-// ============ NEW: Gemini smart Filtering ============
-const { GoogleGenerativeAI } = require('@google/generative-ai');
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || '');
+const CATEGORY_KEYWORDS = {
+  Food: ['food','restaurant','cafe','pizza','burger','biryani','chai','yogurt','thali','rolls','subway','domino','kfc','mcdonald','pizza hut','burger king','cafe coffee day','cafe'],
+  Retail: ['retail','apparel','fashion','grocery','electronics','mart','store','shop','boutique'],
+  'Sports & Equipment': ['sports','equipment','cricket','football','badminton','tennis','gym','fitness','sports shop']
+};
 
-const availableRoutes = [
-  '/franchise/oppurtunties',
-  '/startups-zone-opportunities',
-  '/startups-zone-investorhub',
-  '/government-scheme-listing',
-  '/product-category',
-  '/software-hunt-home',
-  '/research',
-  '/expert-listing',
-  '/project-reports-listing',
-  '/data-listing',
-  '/coming-soon'
-];
-
-const franchiseCategories = ['Food', 'Retail', 'Sports & Equipment'];
-
-app.post('/api/parse-query', async (req, res) => {
-  try {
-    const { query } = req.body;
-    console.log(`✅ Called with query: ${query}`);
-
-
-    if (!query || typeof query !== 'string') {
-      return res.status(400).json({ error: 'Query is required and must be a string' });
+function parseQueryFallback(query) {
+  const q = (query || '').toLowerCase();
+  // category
+  let category = null;
+  for (const [cat, keywords] of Object.entries(CATEGORY_KEYWORDS)) {
+    for (const kw of keywords) {
+      if (q.includes(kw)) { category = cat; break; }
     }
+    if (category) break;
+  }
 
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: 'Gemini API key not configured' });
+  // ROI percent
+  let roi = null;
+  const roiMatch = q.match(/(\d{1,3}(?:\.\d+)?)\s*%/);
+  if (roiMatch) roi = Number(roiMatch[1]);
+
+  // location
+  let location = null;
+  for (const [k, v] of Object.entries(CITY_SYNONYMS)) {
+    if (q.includes(k)) { location = v; break; }
+  }
+  // try capitalized words as fallback (simple)
+  if (!location) {
+    const cityCandidates = ['Bangalore','Mumbai','Delhi','Hyderabad','Chennai','Pune','Gurgaon'];
+    for (const c of cityCandidates) {
+      if (q.includes(c.toLowerCase())) { location = c; break; }
     }
+  }
 
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  // Investment ranges (numbers with ₹ or rupees, lakhs, crores)
+  const parseCurrency = (str) => {
+    if (!str) return null;
+    str = str.replace(/[,₹\s]/g,'').toLowerCase();
+    // handle lakhs (e.g., 5l or 5lakh or 5lakh)
+    const lakhMatch = str.match(/(\d+(?:\.\d+)?)\s*l/);
+    if (lakhMatch) return Math.round(Number(lakhMatch[1]) * 100000);
+    const croreMatch = str.match(/(\d+(?:\.\d+)?)\s*cr/);
+    if (croreMatch) return Math.round(Number(croreMatch[1]) * 10000000);
+    const num = Number(str);
+    return Number.isFinite(num) ? num : null;
+  };
 
-    const prompt = `You are a query parser for a franchise discovery platform. Analyze the user query and extract relevant information.
+  let minInvestment = null;
+  let maxInvestment = null;
+  // common patterns: "between X and Y", "min X", "up to X"
+  const betweenMatch = q.match(/between\s+([\d,₹\s\.kKmMcrl]+?)\s+(?:and|-)\s+([\d,₹\s\.kKmMcrl]+)/);
+  if (betweenMatch) {
+    minInvestment = parseCurrency(betweenMatch[1]);
+    maxInvestment = parseCurrency(betweenMatch[2]);
+  } else {
+    const upTo = q.match(/(?:up to|upto|less than|under)\s+([\d,₹\s\.kKmMcrl]+)/);
+    if (upTo) maxInvestment = parseCurrency(upTo[1]);
+    const atLeast = q.match(/(?:at least|minimum|min)\s+([\d,₹\s\.kKmMcrl]+)/);
+    if (atLeast) minInvestment = parseCurrency(atLeast[1]);
+    // single number maybe means minInvestment
+    if (!minInvestment && !maxInvestment) {
+      const single = q.match(/(?:investment|invest|₹|rs\.?|rupees)?\s*([\d,₹\s,\.]+)\s*(?:lakh|lakhs|k|crore|cr|crores)?/);
+      if (single) {
+        const val = parseCurrency(single[0]);
+        if (val) minInvestment = val;
+      }
+    }
+  }
 
-Available routes: ${availableRoutes.join(', ')}
+  return {
+    route: '/franchise/oppurtunties',
+    subKeywords: {
+      category,
+      roi,
+      location,
+      minInvestment,
+      maxInvestment
+    }
+  };
+}
 
-Available franchise categories: ${franchiseCategories.join(', ')}
-
+// Prompt builder used only when Gemini configured
+function buildPromptForGemini(query) {
+  const availableRoutes = [
+    '/franchise/oppurtunties',
+    '/startups-zone-opportunities',
+    '/startups-zone-investorhub',
+    '/government-scheme-listing',
+    '/product-category',
+    '/software-hunt-home',
+    '/research',
+    '/expert-listing',
+    '/project-reports-listing',
+    '/data-listing',
+    '/coming-soon'
+  ];
+  const franchiseCategories = ['Food','Retail','Sports & Equipment'];
+  return `You are a strict JSON-only parser. Available routes: ${availableRoutes.join(', ')}. Categories: ${franchiseCategories.join(', ')}.
 User Query: "${query}"
-
-Extract the following information:
-1. Route: Determine which route/page the user wants to navigate to based on the query intent. Must be one of the available routes.
-2. Category: If the query mentions a franchise category, extract it. 
-   - If query contains "food", "restaurant", "cafe", "pizza", "burger", "biryani", "chai", "yogurt", "thali", "rolls", "subway", "domino", "kfc", "mcdonald", "pizza hut", "burger king", "cafe coffee day" → return "Food"
-   - If query contains "retail", "apparel", "fashion", "grocery", "electronics", "mart", "store", "shop" (but not sports shop) → return "Retail"
-   - If query contains "sports", "equipment", "cricket", "football", "badminton", "tennis", "gym", "fitness" → return "Sports & Equipment"
-   - Return null if category is not clearly mentioned
-3. ROI: Extract ROI percentage if mentioned (e.g., "8%", "10%", "12%"). Return null if not mentioned.
-4. Location: Extract location/city if mentioned (e.g., "Bangalore", "Mumbai", "Delhi", "Pune", "Hyderabad", "Chennai", "Gurgaon"). Return null if not mentioned.
-5. MinInvestment: Extract minimum investment amount if mentioned. Return null if not mentioned.
-6. MaxInvestment: Extract maximum investment amount if mentioned. Return null if not mentioned.
-
-Return ONLY a valid JSON object in this exact format (no markdown, no extra text):
+Return ONLY JSON in this shape:
 {
   "route": "/franchise/oppurtunties",
   "subKeywords": {
-    "category": "Food",
-    "roi": 8,
-    "location": "Bangalore",
-    "minInvestment": null,
-    "maxInvestment": null
+    "category": "Food|Retail|Sports & Equipment|null",
+    "roi": number|null,
+    "location": "CityName|null",
+    "minInvestment": number|null,
+    "maxInvestment": number|null
   }
+}`;
 }
 
-Important rules:
-- Route must be one of the available routes listed above
-- Category must be EXACTLY one of: "Food", "Retail", "Sports & Equipment", or null (case-sensitive)
-- Only parse subKeywords if the route is "/franchise/oppurtunties"
-- ROI should be a number (percentage) or null
-- Location should be a string (city name) or null
-- MinInvestment and MaxInvestment should be numbers (in rupees) or null
-- If a value is not mentioned in the query, use null
-- Be intelligent about synonyms (e.g., "food franchise" = category "Food", "Bengaluru" = "Bangalore")
-- For "Food Franchise" query, category MUST be "Food"`;
+// /api/parse-query endpoint
+app.post('/api/parse-query', async (req, res) => {
+  const { query } = req.body || {};
+  if (!query || typeof query !== 'string') {
+    return res.status(400).json({ error: 'query string required' });
+  }
 
-    const result = await model.generateContent(prompt);
-    const text = result.response.text();
+  console.log('🔎 /api/parse-query for:', query);
 
-    // Clean the response text (remove markdown code blocks if present)
-    let cleanedText = text.trim();
-    if (cleanedText.startsWith('```json')) {
-      cleanedText = cleanedText.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
-    } else if (cleanedText.startsWith('```')) {
-      cleanedText = cleanedText.replace(/```\n?/g, '').trim();
-    }
+  // If genAI available & key present, try model first
+  if (hasGenAI && genAI) {
+    try {
+      const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+      const prompt = buildPromptForGemini(query);
+      const result = await model.generateContent(prompt);
+      // SDK exposes response.text() in previous versions — be defensive
+      const raw = (result?.response && typeof result.response.text === 'function')
+        ? await result.response.text()
+        : (result?.response?.text || (typeof result === 'string' ? result : JSON.stringify(result)));
 
-    const parsedResponse = JSON.parse(cleanedText);
+      let cleaned = String(raw).trim();
+      // strip markdown fences
+      cleaned = cleaned.replace(/^```json\s*/i, '').replace(/```$/i,'').trim();
+      const parsed = JSON.parse(cleaned);
 
-    // Validate route
-    if (!availableRoutes.includes(parsedResponse.route)) {
-      parsedResponse.route = '/franchise/oppurtunties';
-    }
-
-    // Validate category - only if route is franchise
-    if (parsedResponse.route === '/franchise/oppurtunties') {
-      if (parsedResponse.subKeywords.category && !franchiseCategories.includes(parsedResponse.subKeywords.category)) {
-        const categoryMap = {
-          'Sports': 'Sports & Equipment',
-          'Sports/Equipment': 'Sports & Equipment',
-          'Equipment': 'Sports & Equipment',
-          'Sports Equipment': 'Sports & Equipment'
-        };
-        parsedResponse.subKeywords.category = categoryMap[parsedResponse.subKeywords.category] || null;
+      // validate structure quickly
+      if (!parsed || !parsed.route) {
+        throw new Error('Model returned invalid JSON');
       }
-    } else {
-      parsedResponse.subKeywords = {
-        category: null,
-        roi: null,
-        location: null,
-        minInvestment: null,
-        maxInvestment: null
-      };
-    }
+      // normalize route
+      const allowed = ['/franchise/oppurtunties','/startups-zone-opportunities','/startups-zone-investorhub','/government-scheme-listing','/product-category','/software-hunt-home','/research','/expert-listing','/project-reports-listing','/data-listing','/coming-soon'];
+      if (!allowed.includes(parsed.route)) parsed.route = '/franchise/oppurtunties';
 
-    res.json(parsedResponse);
-  } catch (error) {
-    console.error('Error parsing query:', error);
-    res.status(500).json({ 
-      error: 'Failed to parse query',
-      message: error.message 
-    });
+      // ensure subKeywords shape
+      parsed.subKeywords = parsed.subKeywords || { category: null, roi: null, location: null, minInvestment: null, maxInvestment: null };
+
+      return res.json(parsed);
+    } catch (err) {
+      console.warn('Model parse failed, falling back to local parser. Error:', err.message);
+      // continue to fallback below
+    }
+  }
+
+  // Fallback parser (always returns valid shape)
+  try {
+    const fallback = parseQueryFallback(query);
+    return res.json(fallback);
+  } catch (err) {
+    console.error('Fallback parse error:', err.message);
+    return res.status(500).json({ error: 'Failed to parse query' });
   }
 });
 
-// Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({ status: 'ok', message: 'Server is running' });
-});
+// Health
+app.get('/api/health', (req, res) => res.json({ status: 'ok', message: 'Server is running' }));
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
   console.log(`✅ Server running on http://localhost:${PORT}`);
-  console.log(`   - POST /api/claude (Claude proxy)`);
-  console.log(`   - POST /api/tavily (Tavily proxy)`);
-  console.log(`   - POST /api/parse-query (Franchise query parser)`);
-  console.log(`   - GET /api/health (Health check)`);
+  console.log('   - POST /api/claude');
+  console.log('   - POST /api/tavily');
+  console.log('   - POST /api/parse-query');
+  console.log('   - GET  /api/health');
 });
